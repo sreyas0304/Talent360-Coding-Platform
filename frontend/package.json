@@ -1,0 +1,17 @@
+{
+  "name": "talent360-coding-platform",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 5173"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@monaco-editor/react": "^4.6.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
