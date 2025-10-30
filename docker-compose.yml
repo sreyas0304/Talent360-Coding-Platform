@@ -1,0 +1,37 @@
+# docker-compose.yml
+version: "3.8"
+services:
+  judge0:
+    image: judge0/judge0:latest
+    privileged: true
+    ports: ["2358:2358"]
+    restart: unless-stopped
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: codejudge
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://app:app@db:5432/codejudge
+      JUDGE0_URL: http://judge0:2358
+    depends_on: [db, judge0]
+    ports: ["8000:8000"]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    depends_on: [backend]
+    ports: ["5173:5173"]
+volumes:
+  dbdata:
