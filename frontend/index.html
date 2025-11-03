@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NeetCode Starter</title>
+<style>
+html, body, #root { height: 100%; margin: 0; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+.container { display: grid; grid-template-columns: 1fr 2fr; height: 100%; }
+.left { border-right: 1px solid #eee; overflow: auto; }
+.right { display: flex; flex-direction: column; }
+.header { padding: 12px; border-bottom: 1px solid #eee; }
+.question-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid #f2f2f2; }
+.question-item:hover { background: #fafafa; }
+.question-item.active { background: #eef6ff; }
+.pane { flex: 1; display: grid; grid-template-rows: auto 1fr auto; }
+.prompt { padding: 12px; border-bottom: 1px solid #eee; white-space: pre-wrap; }
+.actions { padding: 10px; border-top: 1px solid #eee; display: flex; gap: 8px; }
+button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ddd; background: white; cursor: pointer; }
+button.primary { background: #2563eb; color: white; border-color: #2563eb; }
+.results { padding: 10px; border-top: 1px solid #eee; max-height: 180px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; }
+.lang-tabs { padding: 8px; border-bottom: 1px solid #eee; display: flex; gap: 6px; }
+.lang-tabs button.active { background: #111; color: #fff; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
