@@ -4,10 +4,22 @@ import { useParams, Link, useLocation } from 'react-router-dom';
 import EditorPane from '../components/EditorPane.jsx';
 import { templates } from '../lib/languageTemplates.js';
 
-// Allow overriding the API base with Vite env, else default to localhost.
-const API = import.meta.env?.VITE_API_BASE || 'http://localhost:8000/api';
+/**
+ * Runner API (for Run/Submit & fetching your submissions)
+ * Set in frontend/.env as:  VITE_API_BASE=http://localhost:8000/api
+ * If empty, Run/Submit buttons stay disabled and no network calls are made.
+ */
+const API = (import.meta.env?.VITE_API_BASE ?? '').trim();
+const API_ENABLED = API.length > 0;
 
-// Fallback demo questions used if backend API is offline
+/**
+ * Problems API (read-only problem content).
+ * In dev, use Vite proxy (Option A): point this to a *relative* path.
+ * vite.config.js should proxy '/api' -> 'http://localhost:8001'
+ */
+const PROBLEMS_API = (import.meta.env?.VITE_PROBLEMS_API ?? '/api/v1/problems/').trim();
+
+/** Demo fallback if a slug can't be loaded */
 const DEMO_QUESTIONS = [
   {
     id: 'two_sum',
@@ -50,7 +62,6 @@ const styles = {
   },
   left: {
     borderRight: '1px solid #1f2937',
-    // Let the entire left pane own scrolling; not the inner question box
     overflowY: 'auto',
     overflowX: 'hidden',
     background: '#0b1220',
@@ -129,7 +140,6 @@ const styles = {
     border: '1px solid #1f2937',
     padding: 8,
     borderRadius: 8,
-    // Wrap long lines to avoid needing a horizontal scrollbar within the question
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-word',
     overflowX: 'hidden',
@@ -138,17 +148,31 @@ const styles = {
   },
   muted: { color: '#9ca3af' },
   link: { color: '#93c5fd', textDecoration: 'none' },
+  textarea: {
+    width: '100%',
+    minHeight: 180,
+    background: '#111827',
+    color: '#e5e7eb',
+    border: '1px solid #1f2937',
+    borderRadius: 8,
+    padding: 8,
+    fontFamily: 'inherit',
+    resize: 'vertical',
+  },
 };
 
-function parseCodeforcesId(id = '') {
-  const i = id.lastIndexOf('-');
-  if (i <= 0) return null;
-  const contestId = id.slice(0, i);
-  const index = id.slice(i + 1);
-  if (!/^\d+$/.test(contestId)) return null;
-  return { contestId, index };
+/** helpers */
+function joinUrl(base, path) {
+  if (!base) return path || '';
+  const b = base.endsWith('/') ? base : base + '/';
+  const p = (path || '').replace(/^\/+/, '');
+  return b + p;
 }
-
+async function getProblemsJSON(url) {
+  const res = await fetch(url, { mode: 'cors' });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+  }
 function levelFromRating(r) {
   if (r == null) return 'Easy';
   if (r < 1200) return 'Easy';
@@ -156,12 +180,15 @@ function levelFromRating(r) {
   return 'Hard';
 }
 
+/** Runner API helpers (guard against disabled API) */
 async function apiGet(path) {
+  if (!API_ENABLED) throw new Error('API disabled');
   const res = await fetch(`${API}${path}`);
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return res.json();
 }
 async function apiPost(path, body) {
+  if (!API_ENABLED) throw new Error('API disabled');
   const res = await fetch(`${API}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -172,72 +199,189 @@ async function apiPost(path, body) {
 }
 
 export default function Play() {
-  const { qid } = useParams();
+  // Route param (your Primary page links to /play/:slug; routes likely defined as ':qid')
+  const { qid: slug } = useParams();
   const location = useLocation();
-  const ext = location.state?.externalProblem || null;
+  const ext = location.state?.externalProblem || null; // optional CF external fallback
 
+  // Resizable left pane (default 33%, clamp 20–70%)
   const containerRef = useRef(null);
-  const [leftPct, setLeftPct] = useState(() => {
-    const saved = localStorage.getItem('leftPanePct');
-    const n = saved ? Number(saved) : 33;
-    return Number.isFinite(n) ? Math.min(70, Math.max(20, n)) : 33;
-  });
+// Default pane ratio: 40% (left) : 60% (right).
+// Use a new storage key so everyone gets the new default once.
+const LEFT_PANE_KEY = 'leftPanePct_v2';
+const [leftPct, setLeftPct] = useState(() => {
+  const saved = localStorage.getItem(LEFT_PANE_KEY);
+  const n = saved ? Number(saved) : 40;
+  return Number.isFinite(n) ? Math.min(70, Math.max(20, n)) : 40;
+});
   const [dragging, setDragging] = useState(false);
 
+  // Data + UI state
   const [questions, setQuestions] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
+
   const [language, setLanguage] = useState('python');
   const [code, setCode] = useState(templates.python);
+
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
-  const [loadError, setLoadError] = useState(null);
-  const [apiOnline, setApiOnline] = useState(true);
 
-  // External statement handling
+  const [loadError, setLoadError] = useState(null);
+
+  // Runner API online/offline (for Run/Submit & submissions)
+  const [apiOnline, setApiOnline] = useState(false);
+
+  // External CF statement manual paste
   const [statement, setStatement] = useState('');
   const [statementLoading, setStatementLoading] = useState(false);
   const [statementError, setStatementError] = useState('');
 
+  // Left-pane tabs
+  const [activeTab, setActiveTab] = useState('problem'); // 'problem' | 'solution' | 'submissions'
+
+  // Previous submissions tab data
+  const [subs, setSubs] = useState([]);
+  const [subsLoading, setSubsLoading] = useState(false);
+  const [subsError, setSubsError] = useState('');
+
+  const [solLoading, setSolLoading] = useState(false);
+  const [solError, setSolError] = useState('');
+  const [sol, setSol] = useState(null); // single solution text
+  const [solByLang, setSolByLang] = useState(null); // map: { python, java, ruby }
+  const solutionsCacheRef = useRef(new Map()); // cache by problem id
+
+  // Load the selected problem by slug from Problems API (8001 via Vite proxy)
   useEffect(() => {
-    (async () => {
-      let list;
+    let alive = true;
+
+    function adaptProblem(p) {
+      const id = p.slug || p.id || slug || 'problem';
+      const title = p.title || p.name || id;
+      const statement =
+        p.statementMd || p.statement || p.description || p.prompt || '';
+      const inputFormat =
+        p.inputFormat || p.input || p.io?.input || 'See problem statement';
+      const outputFormat =
+        p.outputFormat || p.output || p.io?.output || 'See problem statement';
+
+      const rawSamples = Array.isArray(p.samples)
+        ? p.samples
+        : Array.isArray(p.examples)
+        ? p.examples
+        : [];
+      const examples = rawSamples.map((ex) => ({
+        input: ex.input ?? ex.in ?? '',
+        output: ex.output ?? ex.out ?? '',
+      }));
+
+      // Solutions support
+      let solution = null;
+      let solutionsByLang = null;
+      if (typeof p.solution === 'string') {
+        solution = p.solution;
+      } else if (Array.isArray(p.solutions) && p.solutions.length) {
+        solution = String(p.solutions[0]);
+      } else if (p.solutionsByLang && typeof p.solutionsByLang === 'object') {
+        solutionsByLang = p.solutionsByLang;
+        const anyLang = Object.keys(p.solutionsByLang)[0];
+        solution = p.solutionsByLang[anyLang];
+      }
+
+      return {
+        id,
+        title,
+        difficulty: p.difficulty ? String(p.difficulty) : 'Easy',
+        prompt: statement,
+        inputFormat,
+        outputFormat,
+        examples,
+        solution,
+        solutionsByLang,
+        __external: false,
+      };
+    }
+
+    async function getJSON(url) {
+      // const res = await fetch(url, { mode: 'cors' });
+      // if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      // return res.json();
+      return getProblemsJSON(url);
+    }
+
+    async function fetchBySlug(s) {
+      const candidates = [
+        joinUrl(PROBLEMS_API, encodeURIComponent(s)),
+        joinUrl(PROBLEMS_API, encodeURIComponent(s) + '/'),
+      ];
+      for (const u of candidates) {
+        try {
+          const data = await getJSON(u);
+          const pr = data?.problem ?? data;
+          if (pr && (pr.slug || pr.title)) return adaptProblem(pr);
+        } catch {
+          /* try next */
+        }
+      }
+      // fallback to list and search
       try {
-        const data = await apiGet('/questions'); // try backend
-        setApiOnline(true);
-        list = data;
+        const list = await getJSON(joinUrl(PROBLEMS_API, ''));
+        const arr = Array.isArray(list) ? list : list?.results || [];
+        const match = arr.find((p) => p.slug === s);
+        if (match) return adaptProblem(match);
+      } catch {
+        /* ignore */
+      }
+      // last resort demo
+      return adaptProblem({
+        slug: s,
+        title: 'Problem not found',
+        statement: 'The requested problem could not be loaded from the Local API.',
+        samples: [],
+      });
+    }
+
+    (async () => {
+      try {
+        setLoadError(null);
+        setActiveTab('problem'); // reset to default tab for new slug
+        if (slug) {
+          const q = await fetchBySlug(slug);
+          if (!alive) return;
+          setQuestions([q]);
+          setSelectedId(q.id);
+        } else if (ext) {
+          const pseudo = {
+            id: ext.id,
+            title: `${ext.title} (Codeforces)`,
+            difficulty: levelFromRating(ext.rating),
+            prompt:
+              `External problem from Codeforces. Paste the statement below if you want it visible here.\nLink:\n${ext.url}\n\nRun/Submit are disabled for external problems.`,
+            inputFormat: 'See linked statement',
+            outputFormat: 'See linked statement',
+            examples: [],
+            __external: true,
+            url: ext.url,
+          };
+          setQuestions([pseudo]);
+          setSelectedId(pseudo.id);
+        } else {
+          setQuestions(DEMO_QUESTIONS);
+          setSelectedId(DEMO_QUESTIONS[0]?.id ?? null);
+        }
       } catch (e) {
-        // Backend unreachable → use fallback demo questions
-        setApiOnline(false);
-        list = DEMO_QUESTIONS;
+        if (!alive) return;
+        setLoadError(String(e?.message || e));
+        setQuestions(DEMO_QUESTIONS);
+        setSelectedId(DEMO_QUESTIONS[0]?.id ?? null);
       }
-
-      if (ext) {
-        // Show ONLY the clicked external Codeforces problem in the list
-        const pseudo = {
-          id: ext.id, // e.g., "1831-A"
-          title: `${ext.title} (Codeforces)`,
-          difficulty: levelFromRating(ext.rating),
-          prompt:
-            `External problem from Codeforces.\n\nView full statement at:\n${ext.url}\n\nUse the editor to practice locally. (Run/Submit disabled for external problems.)`,
-          inputFormat: 'See linked statement',
-          outputFormat: 'See linked statement',
-          examples: [],
-          __external: true,
-          url: ext.url,
-        };
-        list = [pseudo];
-      }
-
-      setQuestions(list);
-      const initial =
-        (qid && list.find((q) => q.id === qid)?.id) ||
-        (list[0] && list[0].id) ||
-        null;
-      setSelectedId(initial);
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [qid]);
 
+    return () => {
+      alive = false;
+    };
+  }, [slug, ext]);
+
+  // Keep editor template synced with language
   useEffect(() => {
     setCode(templates[language]);
   }, [language, selectedId]);
@@ -248,42 +392,80 @@ export default function Play() {
   );
   const isExternal = !!selected?.__external;
 
-  // Fetch full statement for external Codeforces problems (readable text via r.jina.ai proxy)
+  // External CF: stop auto-fetch, restore cached pasted statement
   useEffect(() => {
-    let alive = true;
     setStatement('');
     setStatementError('');
     setStatementLoading(false);
-
-    if (!isExternal || !selected?.id) return;
-    const cf = parseCodeforcesId(selected.id);
-    if (!cf) return;
-
-    (async () => {
-      try {
-        setStatementLoading(true);
-        const url = `https://r.jina.ai/http://codeforces.com/problemset/problem/${cf.contestId}/${cf.index}`;
-        const res = await fetch(url);
-        if (!alive) return;
-        if (!res.ok) throw new Error(`Failed to fetch statement (${res.status})`);
-        const text = await res.text();
-        if (!alive) return;
-        setStatement(text || '(No content)');
-      } catch (e) {
-        if (!alive) return;
-        setStatementError(String(e?.message || e));
-      } finally {
-        if (!alive) return;
-        setStatementLoading(false);
-      }
-    })();
-
-    return () => {
-      alive = false;
-    };
+    if (isExternal && selected?.id) {
+      const k = `cf_statement:${selected.id}`;
+      const cached = localStorage.getItem(k);
+      if (cached) setStatement(cached);
+    }
   }, [isExternal, selected?.id]);
 
-  // --- Drag to resize left pane ---
+  useEffect(() => {
+    let alive = true;
+    async function loadSolution() {
+      setSolError('');
+      setSolLoading(false);
+      setSol(null);
+      setSolByLang(null);
+      if (activeTab !== 'solution') return;
+      if (isExternal) return; // external problems don't use local solution API
+      if (!selected?.id) return;
+    
+      // Cache hit?
+      const cached = solutionsCacheRef.current.get(selected.id);
+      if (cached) {
+        setSol(cached.sol ?? null);
+        setSolByLang(cached.solByLang ?? null);
+        return;
+      }
+    
+      const url = joinUrl(PROBLEMS_API, `${encodeURIComponent(selected.id)}/solution/`);
+      try {
+        setSolLoading(true);
+        const data = await getProblemsJSON(url);
+        if (!alive) return;
+    
+        // Adapt various shapes:
+        //  - string
+        //  - { solution: string }
+        //  - { solutionsByLang: { python, java, ruby } }
+        //  - { solutions: [string, ...] }
+        let text = null;
+        let byLang = null;
+        if (typeof data === 'string') {
+          text = data;
+        } else if (data && typeof data === 'object') {
+          if (typeof data.solution === 'string') text = data.solution;
+          if (data.solutionsByLang && typeof data.solutionsByLang === 'object') {
+            byLang = data.solutionsByLang;
+            // pick any as default display
+            const firstLang = Object.keys(byLang)[0];
+            text = byLang[firstLang] ?? text;
+          }
+          if (!text && Array.isArray(data.solutions) && data.solutions.length) {
+            text = String(data.solutions[0]);
+          }
+        }
+        setSol(text);
+        setSolByLang(byLang);
+        solutionsCacheRef.current.set(selected.id, { sol: text, solByLang: byLang });
+      } catch (e) {
+        if (!alive) return;
+        setSolError(String(e?.message || e));
+      } finally {
+        if (!alive) return;
+        setSolLoading(false);
+      }
+    }
+    loadSolution();
+    return () => { alive = false; };
+      }, [activeTab, selected?.id, isExternal]);
+
+  // Drag-resize behavior
   useEffect(() => {
     if (!dragging) return;
     const el = containerRef.current;
@@ -298,18 +480,24 @@ export default function Play() {
     }
     function onUp() {
       setDragging(false);
-      localStorage.setItem('leftPanePct', String(leftPct));
+      localStorage.setItem(LEFT_PANE_KEY, String(leftPct));
       document.body.style.cursor = '';
+      document.documentElement.style.overflowX = '';
+      document.body.style.overflowX = '';
     }
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp, { once: true });
     document.addEventListener('touchmove', onMove, { passive: false });
     document.addEventListener('touchend', onUp, { once: true });
     document.body.style.cursor = 'col-resize';
+    document.documentElement.style.overflowX = 'hidden';
+    document.body.style.overflowX = 'hidden';
     return () => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('touchmove', onMove);
       document.body.style.cursor = '';
+      document.documentElement.style.overflowX = '';
+      document.body.style.overflowX = '';
     };
   }, [dragging, leftPct]);
 
@@ -318,8 +506,41 @@ export default function Play() {
     setDragging(true);
   }
 
+  // Load previous submissions when "submissions" tab is opened
+  useEffect(() => {
+    let alive = true;
+    async function loadSubs() {
+      setSubsError('');
+      setSubs([]);
+      if (activeTab !== 'submissions') return;
+      if (!selected?.id) return;
+      if (!API_ENABLED) {
+        setSubsError('Runner API disabled. Add VITE_API_BASE to enable.');
+        return;
+      }
+      try {
+        setSubsLoading(true);
+        const data = await apiGet(`/submissions?questionId=${encodeURIComponent(selected.id)}`);
+        if (!alive) return;
+        setApiOnline(true);
+        setSubs(Array.isArray(data) ? data : (data?.results || []));
+      } catch (e) {
+        if (!alive) return;
+        setApiOnline(false);
+        setSubsError(String(e?.message || e));
+      } finally {
+        if (!alive) return;
+        setSubsLoading(false);
+      }
+    }
+    loadSubs();
+    return () => {
+      alive = false;
+    };
+  }, [activeTab, selected?.id]);
+
   async function run() {
-    if (!selected || isExternal || !apiOnline) return;
+    if (!selected || isExternal || !API_ENABLED) return;
     setRunning(true);
     setResult(null);
     try {
@@ -328,8 +549,10 @@ export default function Play() {
         language,
         code,
       });
+      setApiOnline(true);
       setResult(data);
     } catch (e) {
+      setApiOnline(false);
       setResult({ error: String(e?.message || e) });
     } finally {
       setRunning(false);
@@ -337,7 +560,7 @@ export default function Play() {
   }
 
   async function submit() {
-    if (!selected || isExternal || !apiOnline) return;
+    if (!selected || isExternal || !API_ENABLED) return;
     try {
       const data = await apiPost('/submit', {
         questionId: selected.id,
@@ -345,83 +568,258 @@ export default function Play() {
         code,
         result: result || { passed: 0, total: 0, runtime_ms: 0 },
       });
+      setApiOnline(true);
       alert(`Saved! Submission ID: ${data.id}`);
     } catch (e) {
+      setApiOnline(false);
       alert(`Submit failed: ${String(e?.message || e)}`);
     }
   }
 
   return (
     <div style={styles.container} ref={containerRef}>
-      {/* LEFT: Full question content (resizable) */}
+      {/* LEFT: Tabs + content (resizable) */}
       <div style={{ ...styles.left, flex: `0 0 ${leftPct}%` }}>
+        {/* Tabs */}
+        <div
+          style={{
+            padding: 12,
+            borderBottom: '1px solid #1f2937',
+            background: '#0b1220',
+            display: 'flex',
+            gap: 8,
+          }}
+        >
+          <button
+            onClick={() => setActiveTab('problem')}
+            style={{
+              padding: '6px 10px',
+              borderRadius: 8,
+              border: '1px solid #1f2937',
+              background: activeTab === 'problem' ? '#2563eb' : '#111827',
+              color: activeTab === 'problem' ? '#fff' : '#e5e7eb',
+              cursor: 'pointer',
+            }}
+          >
+            Problem
+          </button>
+          <button
+            onClick={() => setActiveTab('solution')}
+            style={{
+              padding: '6px 10px',
+              borderRadius: 8,
+              border: '1px solid #1f2937',
+              background: activeTab === 'solution' ? '#2563eb' : '#111827',
+              color: activeTab === 'solution' ? '#fff' : '#e5e7eb',
+              cursor: 'pointer',
+            }}
+          >
+            Solution
+          </button>
+          <button
+            onClick={() => setActiveTab('submissions')}
+            style={{
+              padding: '6px 10px',
+              borderRadius: 8,
+              border: '1px solid #1f2937',
+              background: activeTab === 'submissions' ? '#2563eb' : '#111827',
+              color: activeTab === 'submissions' ? '#fff' : '#e5e7eb',
+              cursor: isExternal ? 'not-allowed' : 'pointer',
+              opacity: isExternal ? 0.6 : 1,
+            }}
+            title={isExternal ? 'Disabled for external problems' : undefined}
+            disabled={isExternal}
+          >
+            Submitted&nbsp;Solutions
+          </button>
+        </div>
+
+        {/* Left content */}
         <div style={styles.prompt}>
           {loadError && (
             <div style={{ color: '#f87171' }}>
-              Failed to load questions: {loadError}
+              Failed to load problem: {loadError}
             </div>
           )}
-          {!apiOnline && (
-            <div style={styles.info}>
-              Backend API <code>{API}</code> is offline. Using demo questions. Start your backend to enable Run/Submit.
-            </div>
-          )}
+
           {!loadError && selected ? (
             <>
-              {isExternal ? (
+              {/* TAB: PROBLEM */}
+              {activeTab === 'problem' && (
                 <>
-                  <div style={styles.info}>
-                    External Codeforces problem.{' '}
-                    <a
-                      href={selected.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={styles.link}
-                    >
-                      Open original ↗
-                    </a>
-                    . Run/Submit are disabled because local test cases are not available.
-                  </div>
-                  <h3 style={{ margin: '4px 0' }}>{selected.title}</h3>
-                  {statementLoading && (
-                    <em style={styles.muted}>Loading full statement…</em>
+                  {isExternal ? (
+                    <>
+                      <div style={styles.info}>
+                        External Codeforces problem. Codeforces blocks automated loading of
+                        statements (CAPTCHA).{' '}
+                        <a
+                          href={selected.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={styles.link}
+                        >
+                          Open original ↗
+                        </a>
+                        . Paste the statement below if you want it visible here.
+                      </div>
+                      <h3 style={{ margin: '4px 0' }}>{selected.title}</h3>
+                      <textarea
+                        style={styles.textarea}
+                        placeholder="Paste the problem statement here (optional)…"
+                        value={statement}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setStatement(v);
+                          if (selected?.id) {
+                            localStorage.setItem(`cf_statement:${selected.id}`, v);
+                          }
+                        }}
+                      />
+                      {!!statement && (
+                        <>
+                          <div style={{ marginTop: 8, fontSize: 12, color: '#9ca3af' }}>
+                            Preview:
+                          </div>
+                          <pre style={styles.pre}>{statement}</pre>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <h3 style={{ margin: '4px 0' }}>{selected.title}</h3>
+                      <p style={{ marginTop: 8 }}>{selected.prompt}</p>
+                      <p>
+                        <strong>Input:</strong> {selected.inputFormat}
+                      </p>
+                      <p>
+                        <strong>Output:</strong> {selected.outputFormat}
+                      </p>
+                      {!!selected.examples?.length && (
+                        <div style={{ marginTop: 8 }}>
+                          <strong>Examples</strong>
+                          <pre style={styles.pre}>
+                            {selected.examples
+                              .map(
+                                (ex, i) =>
+                                  `#${i + 1}\nInput:\n${ex.input}\nOutput:\n${ex.output}\n`
+                              )
+                              .join('\n')}
+                          </pre>
+                        </div>
+                      )}
+                    </>
                   )}
-                  {statementError && (
-                    <div style={{ color: '#f87171' }}>
-                      Failed to load statement: {statementError}
-                    </div>
-                  )}
-                  {!!statement && <pre style={styles.pre}>{statement}</pre>}
                 </>
-              ) : (
+              )}
+
+              {/* TAB: SOLUTION */}
+              {activeTab === 'solution' && (
                 <>
-                  <h3 style={{ margin: '4px 0' }}>{selected.title}</h3>
-                  <p style={{ marginTop: 8 }}>{selected.prompt}</p>
-                  <p>
-                    <strong>Input:</strong> {selected.inputFormat}
-                  </p>
-                  <p>
-                    <strong>Output:</strong> {selected.outputFormat}
-                  </p>
-                  {!!selected.examples?.length && (
-                    <div style={{ marginTop: 8 }}>
-                      <strong>Examples</strong>
-                      <pre style={styles.pre}>
-                        {selected.examples
-                          .map(
-                            (ex, i) =>
-                              `#${i + 1}\nInput:\n${ex.input}\nOutput:\n${ex.output}\n`
-                          )
-                          .join('\n')}
-                      </pre>
+                  <h3 style={{ margin: '4px 0' }}>Solution</h3>
+                  {isExternal ? (
+                    <div style={styles.info}>
+                      No official solution available for external problems in this view. Open
+                      the original link for editorials.
                     </div>
+                  
+                  ) : solLoading ? (
+                              <em style={styles.muted}>Loading solution…</em>
+                  ) : solError ? (
+                              <div style={{ color: '#f87171' }}>{solError}</div>
+                  ) : solByLang ? (
+                    <>
+                      <div style={{ marginBottom: 8, color: '#9ca3af' }}>
+                        Showing solution for <strong>{language}</strong>
+                      </div>
+                      <pre style={styles.pre}>
+                      {String(solByLang[language] ?? sol ?? 'No solution provided.')}
+                      </pre>
+                    </>
+                  ) : sol ? (
+                        <pre style={styles.pre}>{String(sol)}</pre>
+                  ) : (
+                    <div style={styles.info}>No solution provided by the Local API.</div>
+                  )}
+                </>
+              )}
+
+              {/* TAB: SUBMISSIONS */}
+              {activeTab === 'submissions' && (
+                <>
+                  <h3 style={{ margin: '4px 0' }}>Your Submissions</h3>
+                  {isExternal && (
+                    <div style={styles.info}>Disabled for external problems.</div>
+                  )}
+                  {!isExternal && !API_ENABLED && (
+                    <div style={styles.info}>
+                      Runner API is <strong>disabled</strong>. Add <code>VITE_API_BASE</code> to
+                      your <code>.env</code> to enable fetching submissions.
+                    </div>
+                  )}
+                  {!isExternal && API_ENABLED && !apiOnline && (
+                    <div style={styles.info}>
+                      Runner API <code>{API}</code> appears offline. Start it to view your submissions.
+                    </div>
+                  )}
+                  {!isExternal && API_ENABLED && (
+                    <>
+                      {subsLoading && <em style={styles.muted}>Loading…</em>}
+                      {subsError && <div style={{ color: '#f87171' }}>{subsError}</div>}
+                      {!subsLoading && !subsError && !subs.length && (
+                        <div style={styles.muted}>No submissions yet.</div>
+                      )}
+                      {!!subs.length && (
+                        <div style={{ display: 'grid', gap: 8 }}>
+                          {subs.map((s, i) => (
+                            <div
+                              key={s.id ?? i}
+                              style={{
+                                border: '1px solid #1f2937',
+                                borderRadius: 8,
+                                padding: 8,
+                                background: '#111827',
+                              }}
+                            >
+                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                                <span><strong>Status:</strong> {s.status ?? s.verdict ?? '—'}</span>
+                                <span><strong>Lang:</strong> {s.language ?? '—'}</span>
+                                {'runtime_ms' in (s || {}) && (
+                                  <span><strong>Time:</strong> {s.runtime_ms} ms</span>
+                                )}
+                                {'memory_kb' in (s || {}) && (
+                                  <span><strong>Mem:</strong> {s.memory_kb} KB</span>
+                                )}
+                                {s.createdAt && (
+                                  <span className="muted">
+                                    <strong>When:</strong>{' '}
+                                    {new Date(s.createdAt).toLocaleString()}
+                                  </span>
+                                )}
+                              </div>
+                              {s.error && (
+                                <pre style={{ ...styles.pre, marginTop: 8 }}>
+Error:
+{String(s.error)}
+                                </pre>
+                              )}
+                              {s.code && (
+                                <details style={{ marginTop: 8 }}>
+                                  <summary style={{ cursor: 'pointer' }}>View code</summary>
+                                  <pre style={styles.pre}>{String(s.code)}</pre>
+                                </details>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
                   )}
                 </>
               )}
             </>
-          ) : !loadError ? (
-            <em style={styles.muted}>Loading…</em>
-          ) : null}
+          ) : (
+            !loadError && <em style={styles.muted}>Loading…</em>
+          )}
         </div>
       </div>
 
@@ -472,16 +870,16 @@ export default function Play() {
           <div style={styles.actions}>
             <button
               onClick={run}
-              disabled={isExternal || !apiOnline || running || !selected}
+              disabled={isExternal || !API_ENABLED || running || !selected}
               style={{
                 ...styles.button,
-                ...(isExternal || !apiOnline || running ? {} : styles.buttonPrimary),
+                ...(isExternal || !API_ENABLED || running ? {} : styles.buttonPrimary),
               }}
               title={
                 isExternal
                   ? 'Disabled for external problems'
-                  : !apiOnline
-                  ? 'Backend API is offline'
+                  : !API_ENABLED
+                  ? 'Runner API disabled'
                   : 'Run'
               }
             >
@@ -489,13 +887,13 @@ export default function Play() {
             </button>
             <button
               onClick={submit}
-              disabled={isExternal || !apiOnline || !selected}
+              disabled={isExternal || !API_ENABLED || !selected}
               style={styles.button}
               title={
                 isExternal
                   ? 'Disabled for external problems'
-                  : !apiOnline
-                  ? 'Backend API is offline'
+                  : !API_ENABLED
+                  ? 'Runner API disabled'
                   : 'Submit'
               }
             >
@@ -513,8 +911,7 @@ export default function Play() {
             {result && !result.error && (
               <div>
                 <div>
-                  <strong>Verdict:</strong> {result.passed}/{result.total} tests
-                  passed{' '}
+                  <strong>Verdict:</strong> {result.passed}/{result.total} tests passed{' '}
                   {typeof result.runtime_ms === 'number'
                     ? `in ${result.runtime_ms}ms`
                     : ''}
@@ -523,39 +920,33 @@ export default function Play() {
                   {result.results?.map((r, i) => (
                     <li key={i} style={{ marginTop: 8 }}>
                       <div>
-                        Test #{i + 1}:{' '}
-                        {r.ok ? '✅ Passed' : '❌ Failed'} ({r.status})
+                        Test #{i + 1}: {r.ok ? '✅ Passed' : '❌ Failed'} ({r.status})
                       </div>
                       {r.compile_output && (
                         <pre style={styles.pre}>
-                          Compile Output:
-                          {'\n'}
-                          {r.compile_output}
+Compile Output:
+{r.compile_output}
                         </pre>
                       )}
                       {r.stderr && (
                         <pre style={styles.pre}>
-                          Stderr:
-                          {'\n'}
-                          {r.stderr}
+Stderr:
+{r.stderr}
                         </pre>
                       )}
                       {!r.ok && (
                         <>
                           <pre style={styles.pre}>
-                            Input:
-                            {'\n'}
-                            {r.input}
+Input:
+{r.input}
                           </pre>
                           <pre style={styles.pre}>
-                            Expected:
-                            {'\n'}
-                            {r.expected}
+Expected:
+{r.expected}
                           </pre>
                           <pre style={styles.pre}>
-                            Got:
-                            {'\n'}
-                            {r.stdout}
+Got:
+{r.stdout}
                           </pre>
                         </>
                       )}

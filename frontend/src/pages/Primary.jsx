@@ -82,24 +82,14 @@ const styles = {
   err: { color: '#fca5a5', fontSize: 14 },
 };
 
-const CF_ENDPOINT = 'https://codeforces.com/api/problemset.problems';
+const PROBLEMS_API = (import.meta.env?.VITE_PROBLEMS_API ?? '/api/v1/problems/').trim();
 
-// Our categories mapped to Codeforces tags (case sensitive as returned)
-const CF_CATEGORIES = [
-  { key: 'strings', title: 'Strings', desc: 'Parsing, hashing, substrings', tags: ['strings'] },
-  { key: 'dp', title: 'Dynamic Programming', desc: 'Knapsack, paths, states', tags: ['dp'] },
-  { key: 'graphs', title: 'Graphs', desc: 'DFS/BFS, trees, shortest paths', tags: ['graphs', 'trees', 'dfs and similar', 'shortest paths'] },
-  { key: 'math', title: 'Math & Number Theory', desc: 'Number theory, combinatorics', tags: ['math', 'number theory', 'combinatorics'] },
-  { key: 'greedy', title: 'Greedy & Binary Search', desc: 'Greedy choices and searching', tags: ['greedy', 'binary search', 'two pointers'] },
-  { key: 'impl', title: 'Implementation & Brute Force', desc: 'Simulations, constructive', tags: ['implementation', 'brute force', 'constructive algorithms'] },
-];
-
-function tierFromRating(r) {
-  if (r == null) return 'Easy';
-  if (r < 1200) return 'Easy';
-  if (r < 1800) return 'Medium';
-  return 'Hard';
-}
+function tierFromDifficultyStr(d) {
+  const v = String(d || '').toLowerCase();
+  if (v === 'hard') return 'Hard';
+  if (v === 'medium') return 'Medium';
+  return 'Easy';
+  }
 
 function Category({ cat, open, onToggle }) {
   return (
@@ -108,7 +98,7 @@ function Category({ cat, open, onToggle }) {
         <div style={{ ...styles.chevron, ...(open ? styles.chevronOpen : {}) }} />
         <div style={{ display: 'grid' }}>
           <span style={styles.catTitle}>{cat.title}</span>
-          <span style={styles.catDesc}>{cat.desc}</span>
+          {!!cat.desc && <span style={styles.catDesc}>{cat.desc}</span>}
         </div>
       </div>
       {open && (
@@ -121,7 +111,6 @@ function Category({ cat, open, onToggle }) {
                   <Link
                     key={p.id}
                     to={`/play/${p.id}`}
-                    state={{ externalProblem: p }}
                     style={styles.pill}
                     title={`Open ${p.title}`}
                   >
@@ -132,9 +121,7 @@ function Category({ cat, open, onToggle }) {
               </div>
             </div>
           ))}
-          <div style={styles.small}>
-            Showing up to {cat.limitPerLevel} per difficulty • Source: Codeforces
-          </div>
+          <div style={styles.small}>Showing up to {cat.limitPerLevel} per difficulty • Source: Local API</div>
         </div>
       )}
     </div>
@@ -152,48 +139,43 @@ export default function Primary() {
     let alive = true;
     (async () => {
       try {
-        const res = await fetch(CF_ENDPOINT);
-        if (!res.ok) throw new Error(`CF fetch failed: ${res.status}`);
-        const json = await res.json();
-        if (json.status !== 'OK') throw new Error('CF API status not OK');
+        const res = await fetch(PROBLEMS_API, { mode: 'cors' });
+       if (!res.ok) throw new Error(`Problems fetch failed: ${res.status}`);
+       const raw = await res.json(); // expects an array of { slug, title, difficulty, categories[] }
 
-        const problems = json.result.problems || [];
-        // Map to internal shape
-        const mapped = problems
-          .filter((p) => p.contestId && p.index && p.name) // basic sanity
-          .map((p) => ({
-            id: `${p.contestId}-${p.index}`,
-            title: p.name,
-            rating: p.rating ?? null,
-            tags: p.tags || [],
-            url: `https://codeforces.com/problemset/problem/${p.contestId}/${p.index}`,
-            source: 'codeforces',
-          }));
+       // Build dynamic categories from the response
+       // catName -> { Easy:[], Medium:[], Hard:[] }
+       const bucket = new Map();
+       for (const item of raw || []) {
+         const title = item.title || item.slug;
+         const id = item.slug || title.replace(/\s+/g, '-').toLowerCase();
+         const lvl = tierFromDifficultyStr(item.difficulty);
+         const catNames = Array.isArray(item.categories) ? item.categories : [];
 
-        // Build categories using tag inclusion
-        const built = CF_CATEGORIES.map((c) => {
-          const inCat = mapped.filter((m) =>
-            m.tags.some((t) => c.tags.includes(t))
-          );
-          // Bucket by difficulty
-          const groups = { Easy: [], Medium: [], Hard: [] };
-          for (const m of inCat) {
-            const lvl = tierFromRating(m.rating);
-            if (groups[lvl].length < limitPerLevel) {
-              groups[lvl].push({
-                id: m.id,
-                title: m.title,
-                difficulty: lvl,
-                url: m.url,
-                rating: m.rating,
-                tags: m.tags,
-              });
-            }
-          }
-          return { key: c.key, title: c.title, desc: c.desc, groups, limitPerLevel };
-        });
+         for (const name of catNames) {
+           const key = String(name || '').trim();
+           if (!key) continue;
+           if (!bucket.has(key)) {
+             bucket.set(key, { key, title: key, desc: '', groups: { Easy: [], Medium: [], Hard: [] } });
+           }
+           const entry = bucket.get(key);
+           if (entry.groups[lvl].length < limitPerLevel) {
+             entry.groups[lvl].push({
+               id,                 // we'll use slug as the route param
+               title,
+               difficulty: lvl,
+               // keep a hint of origin for future use
+               source: 'local',
+             });
+           }
+         }
+       }
 
-        if (alive) setCats(built);
+       // Sort categories and freeze list
+       const built = Array.from(bucket.values()).sort((a, b) =>
+         a.title.localeCompare(b.title)
+       );
+       if (alive) setCats(built);
       } catch (e) {
         if (alive) setErr(String(e?.message || e));
       }
@@ -216,7 +198,7 @@ export default function Primary() {
     <div style={styles.page}>
       <div style={styles.container}>
         <div style={styles.headerRow}>
-          <h1 style={styles.h1}>Practice Categories (Codeforces)</h1>
+          <h1 style={styles.h1}>Practice Categories (Local API)</h1>
           <Link to="/play" style={styles.action}>Open Playground</Link>
         </div>
 
